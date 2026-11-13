@@ -1,0 +1,96 @@
+Run these in order on a fresh Ubuntu 22.04/24.04 VM. The vendor app and the setup.sh script were tested; the service files and OpenBao production settings below were not tested on a real machine, so read the output of each step.
+
+1. Base packages and Node 22 (the app needs Node 22.13 or newer)
+
+bash
+sudo apt-get update && sudo apt-get install -y curl git unzip ufw
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+node --version        # must print v22.13 or higher
+
+2. OpenBao (holds the signing key)
+Check the latest version at github.com/openbao/openbao/releases; I tested 2.4.0.
+
+bash
+V=2.4.0
+curl -fsSL -o /tmp/bao.tgz https://github.com/openbao/openbao/releases/download/v$V/bao_${V}_Linux_x86_64.tar.gz
+sudo tar -xzf /tmp/bao.tgz -C /usr/local/bin bao && sudo chmod 755 /usr/local/bin/bao
+bao version
+sudo useradd --system --home /var/lib/openbao --shell /usr/sbin/nologin openbao
+sudo mkdir -p /etc/openbao /var/lib/openbao && sudo chown openbao:openbao /var/lib/openbao && sudo chmod 700 /var/lib/openbao
+
+Get the app next so you have the example config, then copy it:
+
+bash
+sudo git clone <YOUR-PRIVATE-REPO-URL> /opt/asix-vendor
+cd /opt/asix-vendor && sudo npm install --omit=dev
+sudo cp deploy/openbao/openbao.hcl.example /etc/openbao/openbao.hcl
+sudo tee /etc/systemd/system/openbao.service >/dev/null <<'EOF'
+[Unit]
+Description=OpenBao
+After=network-online.target
+[Service]
+User=openbao
+Group=openbao
+ExecStart=/usr/local/bin/bao server -config=/etc/openbao/openbao.hcl
+Restart=on-failure
+LimitNOFILE=65536
+AmbientCapabilities=CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_IPC_LOCK
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload && sudo systemctl enable --now openbao
+export BAO_ADDR=http://127.0.0.1:8200
+
+3. Initialise and unseal it (once)
+
+bash
+bao operator init -key-shares=5 -key-threshold=3
+
+This prints 5 unseal keys and a root token. Copy all of them somewhere safe now, with each key held by a different person or place. They are shown once.
+
+bash
+bao operator unseal      # run three times, pasting a different key each time
+
+After every reboot of this VM, OpenBao starts sealed and you must unseal it again.
+
+4. Create the signing key and the server’s token
+
+bash
+sudo mkdir -p /etc/asix-vendor && sudo chmod 750 /etc/asix-vendor
+cd /opt/asix-vendor
+sudo BAO_ADDR=$BAO_ADDR BAO_TOKEN=<ROOT-TOKEN> ./deploy/openbao/setup.sh --token-file /etc/asix-vendor/bao.token
+
+Then put the root token away; you won’t use it day to day.
+
+5. Configure and start the vendor server
+
+bash
+sudo useradd --system --home /var/lib/asix-vendor --shell /usr/sbin/nologin asixvendor
+sudo mkdir -p /var/lib/asix-vendor && sudo chown asixvendor:asixvendor /var/lib/asix-vendor && sudo chmod 700 /var/lib/asix-vendor
+sudo chown root:asixvendor /etc/asix-vendor /etc/asix-vendor/bao.token && sudo chmod 640 /etc/asix-vendor/bao.token
+sudo cp /opt/asix-vendor/config.example.json /etc/asix-vendor/config.json
+sudo nano /etc/asix-vendor/config.json       # set baseUrl, signer.kid (e.g. asix-2026-1), smtp (or leave for later)
+sudo -u asixvendor ASIX_VENDOR_CONFIG=/etc/asix-vendor/config.json node /opt/asix-vendor/server/index.js create-user --username ash --name "Ash" --role admin
+
+The last command asks for a password (12+ characters) and prints an authenticator secret once; add it to your authenticator app.
+
+bash
+sudo cp /opt/asix-vendor/deploy/systemd/asix-vendor.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now asix-vendor
+curl -s http://127.0.0.1:8443/api/health          # {"success":true,"status":"up"}
+sudo -u asixvendor ASIX_VENDOR_CONFIG=/etc/asix-vendor/config.json node /opt/asix-vendor/server/index.js signer-info
+
+signer-info prints the line to paste into KEYS in the ASIX product’s src/licensing/vendor-keys.js.
+
+6. Reach it safely
+The server listens on 127.0.0.1 only. cookieSecure must be true behind TLS, so put a TLS proxy in front (Caddy or nginx), or for a first look use an SSH tunnel: ssh -L 8443:127.0.0.1:8443 you@vm, then open http://localhost:8443. Over plain http through a tunnel, temporarily set "cookieSecure": false in the config, restart the service, and set it back to true once TLS is in place. Block everything except SSH (and 443 from your VPN or office address):
+
+bash
+sudo ufw allow OpenSSH && sudo ufw enable
+
+7. First check
+Sign in, create a test client, add an installation id, generate a Residential license, and check Audit shows “Chain intact”. If Settings shows the signing key as “NOT working”, OpenBao is probably sealed.
+
+Back up two things from day one: an OpenBao snapshot (bao operator raft snapshot save, kept away from the unseal keys) and /var/lib/asix-vendor/vendor.db.
