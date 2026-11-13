@@ -1,0 +1,23 @@
+[Unit]
+Description=ASIX vendor server
+After=network-online.target openbao.service
+Wants=network-online.target
+
+[Service]
+User=asixvendor
+Group=asixvendor
+WorkingDirectory=/opt/asix-vendor
+Environment=ASIX_VENDOR_CONFIG=/etc/asix-vendor/config.json
+ExecStart=/usr/bin/node server/index.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/asix-vendor
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

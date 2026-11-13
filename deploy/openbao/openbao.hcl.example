@@ -1,0 +1,13 @@
+# A minimal OpenBao server for the vendor signing key. Adjust paths and addresses. Run it on its own small machine (or at least its own user), reachable only from the vendor server.
+ui            = false
+disable_mlock = false
+storage "raft" {
+  path    = "/var/lib/openbao"
+  node_id = "vendor-signing-1"
+}
+listener "tcp" {
+  address       = "127.0.0.1:8200"       # or an internal address with TLS below
+  tls_disable   = true                   # set false and add tls_cert_file / tls_key_file if the vendor server is on another machine
+}
+api_addr     = "http://127.0.0.1:8200"
+cluster_addr = "http://127.0.0.1:8201"

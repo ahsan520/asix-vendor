@@ -1,0 +1,13 @@
+{
+  "port": 8443,
+  "bind": "127.0.0.1",
+  "dataDir": "/var/lib/asix-vendor",
+  "baseUrl": "https://license.example.com",
+  "cookieSecure": true,
+  "signer": { "type": "openbao", "addr": "http://127.0.0.1:8200", "tokenFile": "/etc/asix-vendor/bao.token", "mount": "transit", "key": "asix-license", "kid": "asix-2026-1" },
+  "smtp": { "host": "smtp.example.com", "port": 587, "secure": false, "user": "licenses@example.com", "passFile": "/etc/asix-vendor/smtp.pass", "from": "ASIX Licensing <licenses@example.com>", "replyTo": "support@example.com" },
+  "approval": "enterprise",
+  "remindersEnabled": false,
+  "reminderDays": [60, 30, 7],
+  "sessionHours": 8
+}
