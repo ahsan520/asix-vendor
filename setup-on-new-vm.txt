@@ -1,4 +1,6 @@
-Run these in order on a fresh Ubuntu 22.04/24.04 VM. The vendor app and the setup.sh script were tested; the service files and OpenBao production settings below were not tested on a real machine, so read the output of each step.
+Run these in order on a fresh Ubuntu 22.04/24.04 VM (x86_64 or arm64). The vendor app and the setup.sh script were tested in the repo's test suite. The steps below were then run by hand on an Ubuntu arm64 VM with OpenBao 2.7.2, Node 22.23.5 and Caddy, and fixed where they failed. Read the output of each step. If something fails, see "If something goes wrong" at the end.
+
+Placeholders used below: <VM-IP> is the address of the interface you will browse to (see step 6); <ROOT-TOKEN> is the OpenBao root token printed by "bao operator init".
 
 1. Base packages and Node 22 (the app needs Node 22.13 or newer)
 
@@ -9,12 +11,23 @@ sudo apt-get install -y nodejs
 node --version        # must print v22.13 or higher
 
 2. OpenBao (holds the signing key)
-Check the latest version at github.com/openbao/openbao/releases; I tested 2.4.0.
+Check the latest version at github.com/openbao/openbao/releases. Tested: 2.7.2 on arm64 (2.4.0 on x86_64 before that).
+Release file names changed between versions (2.4.0 used bao_<ver>_Linux_<arch>.tar.gz, 2.7.2 uses openbao_<ver>_linux_<arch>.tar.gz), and the x86_64 build may not be called "x86_64" in newer releases. Do not guess: list the release files for your machine first.
 
 bash
-V=2.4.0
-curl -fsSL -o /tmp/bao.tgz https://github.com/openbao/openbao/releases/download/v$V/bao_${V}_Linux_x86_64.tar.gz
-sudo tar -xzf /tmp/bao.tgz -C /usr/local/bin bao && sudo chmod 755 /usr/local/bin/bao
+uname -m              # x86_64 or aarch64: the binary MUST match this
+V=2.7.2
+curl -fsSL https://api.github.com/repos/openbao/openbao/releases/tags/v$V | grep -o '"name": *"[^"]*"' | grep -i -E 'linux.*\.tar\.gz"' | grep -v -E 'sbom|sig'
+
+Pick the .tar.gz for your machine (arm64 for aarch64; the amd64/x86_64 one for x86_64) and put its exact name in FILE:
+
+bash
+FILE=openbao_${V}_linux_arm64.tar.gz       # change to the name listed above for your machine
+curl -fsSL -o /tmp/bao.tgz https://github.com/openbao/openbao/releases/download/v$V/$FILE
+tar -tzf /tmp/bao.tgz                       # must list: bao
+sha256sum /tmp/bao.tgz                      # compare with the release's checksum file, or verify the .sigstore.json / .gpgsig signature
+sudo tar -xzf /tmp/bao.tgz -C /usr/local/bin bao && sudo chown root:root /usr/local/bin/bao && sudo chmod 755 /usr/local/bin/bao
+file /usr/local/bin/bao                     # must say "ARM aarch64" on an arm64 VM, "x86-64" on x86_64
 bao version
 sudo useradd --system --home /var/lib/openbao --shell /usr/sbin/nologin openbao
 sudo mkdir -p /etc/openbao /var/lib/openbao && sudo chown openbao:openbao /var/lib/openbao && sudo chmod 700 /var/lib/openbao
@@ -25,6 +38,13 @@ bash
 sudo git clone <YOUR-PRIVATE-REPO-URL> /opt/asix-vendor
 cd /opt/asix-vendor && sudo npm install --omit=dev
 sudo cp deploy/openbao/openbao.hcl.example /etc/openbao/openbao.hcl
+sudo chmod 644 /etc/openbao/openbao.hcl
+grep -n mlock /etc/openbao/openbao.hcl        # must print nothing (see below)
+
+Newer OpenBao refuses to start if the config contains a "disable_mlock" line (it dropped mlock support). The example config in this repo no longer has it. If your copy does, delete the line: sudo sed -i '/disable_mlock/d' /etc/openbao/openbao.hcl
+Instead of mlock, keep swap off so secrets in memory are never written to disk: check "swapon --show" (empty is fine), otherwise "sudo swapoff -a" and remove the swap entry from /etc/fstab.
+
+bash
 sudo tee /etc/systemd/system/openbao.service >/dev/null <<'EOF'
 [Unit]
 Description=OpenBao
@@ -35,62 +55,146 @@ Group=openbao
 ExecStart=/usr/local/bin/bao server -config=/etc/openbao/openbao.hcl
 Restart=on-failure
 LimitNOFILE=65536
-AmbientCapabilities=CAP_IPC_LOCK
-CapabilityBoundingSet=CAP_IPC_LOCK
 [Install]
 WantedBy=multi-user.target
 EOF
 sudo systemctl daemon-reload && sudo systemctl enable --now openbao
+sleep 3
+sudo systemctl status openbao --no-pager | head -8
 export BAO_ADDR=http://127.0.0.1:8200
+bao status          # "Initialized false" and "Sealed true" are expected here
+
+If "bao status" says connection refused straight after the start, wait a few seconds and run it again.
 
 3. Initialise and unseal it (once)
 
 bash
 bao operator init -key-shares=5 -key-threshold=3
 
-This prints 5 unseal keys and a root token. Copy all of them somewhere safe now, with each key held by a different person or place. They are shown once.
+This prints 5 unseal keys and a root token. Copy all of them somewhere safe now (a password manager), with each key held by a different person or place. They are shown only once. Do not paste them into chat or tickets.
 
 bash
 bao operator unseal      # run three times, pasting a different key each time
+bao status               # Sealed must be false
 
 After every reboot of this VM, OpenBao starts sealed and you must unseal it again.
 
-4. Create the signing key and the server’s token
+4. Create the signing key and the server's token
 
 bash
 sudo mkdir -p /etc/asix-vendor && sudo chmod 750 /etc/asix-vendor
 cd /opt/asix-vendor
-sudo BAO_ADDR=$BAO_ADDR BAO_TOKEN=<ROOT-TOKEN> ./deploy/openbao/setup.sh --token-file /etc/asix-vendor/bao.token
+sudo BAO_ADDR=$BAO_ADDR BAO_TOKEN=<ROOT-TOKEN> bash ./deploy/openbao/setup.sh --token-file /etc/asix-vendor/bao.token
 
-Then put the root token away; you won’t use it day to day.
+(Running it with "bash" avoids "Permission denied" when the repo came from a zip and lost the execute bit.) It should print: enabled the transit engine, created the Ed25519 key asix-license, loaded the policy asix-sign, wrote the token file.
+Then put the root token away; you won't use it day to day.
 
 5. Configure and start the vendor server
 
 bash
 sudo useradd --system --home /var/lib/asix-vendor --shell /usr/sbin/nologin asixvendor
 sudo mkdir -p /var/lib/asix-vendor && sudo chown asixvendor:asixvendor /var/lib/asix-vendor && sudo chmod 700 /var/lib/asix-vendor
-sudo chown root:asixvendor /etc/asix-vendor /etc/asix-vendor/bao.token && sudo chmod 640 /etc/asix-vendor/bao.token
 sudo cp /opt/asix-vendor/config.example.json /etc/asix-vendor/config.json
-sudo nano /etc/asix-vendor/config.json       # set baseUrl, signer.kid (e.g. asix-2026-1), smtp (or leave for later)
-sudo -u asixvendor ASIX_VENDOR_CONFIG=/etc/asix-vendor/config.json node /opt/asix-vendor/server/index.js create-user --username ash --name "Ash" --role admin
+sudo chown root:asixvendor /etc/asix-vendor /etc/asix-vendor/bao.token /etc/asix-vendor/config.json
+sudo chmod 750 /etc/asix-vendor && sudo chmod 640 /etc/asix-vendor/bao.token /etc/asix-vendor/config.json
+sudo ls -l /etc/asix-vendor       # needs sudo on purpose: your normal login cannot read this folder
 
-The last command asks for a password (12+ characters) and prints an authenticator secret once; add it to your authenticator app.
+The service runs as asixvendor, so it must be able to read config.json and bao.token (group asixvendor, mode 640).
+Now edit the config. The signer settings in the example already match what setup.sh created; you only need to set these:
+
+bash
+sudo nano /etc/asix-vendor/config.json
+# baseUrl      your real URL, or http://localhost:8443 while you use an SSH tunnel (see step 6)
+# cookieSecure false ONLY for plain http through an SSH tunnel; true behind TLS (the normal case, step 6)
+# signer.kid   keep asix-2026-1 or choose your own; it must match the KEYS entry in the ASIX product
+# smtp.host    set to null until mail is ready (the Settings page then shows e-mail as not configured)
+sudo python3 -m json.tool /etc/asix-vendor/config.json >/dev/null && echo valid
+
+Create the first admin user. The first admin must be made here on the command line: the GUI's user page needs an admin to be signed in, and there is no first-run page. Pass the password through the environment variable (the interactive prompt can swallow pasted lines and wrongly report "at least 12 characters"). Type the password at the read prompt, as its own command, not pasted together with others:
+
+bash
+read -rsp "New admin password (12+ chars): " PW; echo
+sudo -u asixvendor ASIX_VENDOR_CONFIG=/etc/asix-vendor/config.json ASIX_VENDOR_NEW_PASSWORD="$PW" node /opt/asix-vendor/server/index.js create-user --username ash --name "Ash" --role admin
+unset PW
+
+It prints an authenticator secret once. Add it to your authenticator app straight away and do not paste it anywhere shared. If it ever is exposed, sign in and use Users > "Reset password and code" for that user (it asks for a new password, signs the user out, shows a new secret once, and the old one stops working).
 
 bash
 sudo cp /opt/asix-vendor/deploy/systemd/asix-vendor.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now asix-vendor
+sleep 2
+systemctl status asix-vendor --no-pager | head -6
 curl -s http://127.0.0.1:8443/api/health          # {"success":true,"status":"up"}
 sudo -u asixvendor ASIX_VENDOR_CONFIG=/etc/asix-vendor/config.json node /opt/asix-vendor/server/index.js signer-info
 
-signer-info prints the line to paste into KEYS in the ASIX product’s src/licensing/vendor-keys.js.
+signer-info prints the line to paste into KEYS in the ASIX product's src/licensing/vendor-keys.js (the kid must match signer.kid).
 
 6. Reach it safely
-The server listens on 127.0.0.1 only. cookieSecure must be true behind TLS, so put a TLS proxy in front (Caddy or nginx), or for a first look use an SSH tunnel: ssh -L 8443:127.0.0.1:8443 you@vm, then open http://localhost:8443. Over plain http through a tunnel, temporarily set "cookieSecure": false in the config, restart the service, and set it back to true once TLS is in place. Block everything except SSH (and 443 from your VPN or office address):
+The server listens on 127.0.0.1 only and must stay that way. Do not set "bind" to a LAN address: the app speaks plain http, so passwords and session cookies would cross the network unencrypted.
+
+Option A: SSH tunnel (quick first look). From your own computer:
 
 bash
-sudo ufw allow OpenSSH && sudo ufw enable
+ssh -L 8443:127.0.0.1:8443 asix@<VM-IP>
+
+then open http://localhost:8443. Over plain http through a tunnel, set "cookieSecure": false and "baseUrl": "http://localhost:8443" in the config and restart the service (sudo systemctl restart asix-vendor). Set both back when you move to option B.
+
+Option B: HTTPS on the VM's address with Caddy (recommended). Find the interface you browse to (the management or VPN one, not a public one) with "ip -br addr" and use that address as <VM-IP>:
+
+bash
+sudo apt-get install -y caddy
+sudo tee /etc/caddy/Caddyfile >/dev/null <<'EOF'
+https://<VM-IP> {
+    bind <VM-IP>
+    tls internal
+    reverse_proxy 127.0.0.1:8443
+}
+EOF
+sudo systemctl restart caddy
+sleep 2
+systemctl is-active caddy
+sudo ss -ltnp | grep ':443'
+
+Put the matching settings in /etc/asix-vendor/config.json, then restart the app:
+
+bash
+sudo sed -i 's#"baseUrl": "[^"]*"#"baseUrl": "https://<VM-IP>"#; s#"cookieSecure": false#"cookieSecure": true#' /etc/asix-vendor/config.json
+sudo grep -E 'baseUrl|cookieSecure' /etc/asix-vendor/config.json
+sudo systemctl restart asix-vendor
+
+Open https://<VM-IP>. "tls internal" uses Caddy's own private certificate authority, so the browser warns once: click Advanced, then Proceed. To remove the warning for good, trust Caddy's root certificate on computers you control:
+
+bash
+sudo cp /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt /tmp/caddy-root.crt && sudo chmod 644 /tmp/caddy-root.crt
+# on your computer: scp asix@<VM-IP>:/tmp/caddy-root.crt .   then add it to the system keychain and set it to Always Trust
+sudo rm /tmp/caddy-root.crt
+
+If you have a real DNS name and certificate (for example from your own CA), use that in the Caddyfile instead of "tls internal" and set baseUrl to that name.
+
+Block everything except SSH (and 443 from your own network). Allow SSH first, so you don't lock yourself out:
+
+bash
+sudo ufw allow OpenSSH
+sudo ufw allow from <YOUR-SUBNET, e.g. 192.168.1.0/24> to any port 443 proto tcp
+sudo ufw enable
+
+OpenBao's port 8200 stays closed because it listens on 127.0.0.1 only. Do not expose the vendor server to the internet: use a VPN or an allow-listed address.
 
 7. First check
-Sign in, create a test client, add an installation id, generate a Residential license, and check Audit shows “Chain intact”. If Settings shows the signing key as “NOT working”, OpenBao is probably sealed.
+Sign in, create a test client, add an installation id, generate a Residential license, and check Audit shows "Chain intact". Settings should show the signing key as "working"; if it shows "NOT working", OpenBao is probably sealed. More staff can be added on the Users page after the first admin exists.
 
 Back up two things from day one: an OpenBao snapshot (bao operator raft snapshot save, kept away from the unseal keys) and /var/lib/asix-vendor/vendor.db.
+
+If something goes wrong
+
+- openbao.service fails with "OpenBao has dropped support for mlock": remove the disable_mlock line from /etc/openbao/openbao.hcl (step 2), then: sudo systemctl reset-failed openbao && sudo systemctl restart openbao.
+- openbao.service fails with status=203/EXEC (or "bao version" says Exec format error or "Syntax error"): the binary is for the wrong CPU. Compare "uname -m" with "file /usr/local/bin/bao" and reinstall the matching build (step 2).
+- systemd says "Start request repeated too quickly": fix the cause, then run sudo systemctl reset-failed <service> before restarting.
+- Any service failure: sudo journalctl -u <service> -n 30 --no-pager shows the real error. To see a config error on screen: sudo -u openbao /usr/local/bin/bao server -config=/etc/openbao/openbao.hcl
+- "bao status" says connection refused right after a start: wait a few seconds and retry.
+- setup.sh says Permission denied: run it as "bash ./deploy/openbao/setup.sh ..." (step 4), or chmod +x it.
+- "ls /etc/asix-vendor" says Permission denied: expected for your normal login; use sudo ls.
+- create-user wrongly says the password is under 12 characters: use the ASIX_VENDOR_NEW_PASSWORD method in step 5.
+- The login page cannot be typed into and the browser console or Network tab shows thousands of GET /api/me 401 errors: that is the sign-in loop bug in older public/app.js (line 22 treated the normal "not signed in" 401 from /api/me as an expired session and re-rendered forever). The repo's public/app.js now excludes /api/me there. If your copy still loops: sudo sed -i "s#path !== '/login') { S.me = null#path !== '/login' \&\& path !== '/me') { S.me = null#" /opt/asix-vendor/public/app.js   then hard-reload the page. No restart needed.
+- You can sign in over the tunnel or HTTPS but are bounced straight back to the login page: cookieSecure does not match how you connect. Use false only for plain http, true for https.
+- After a reboot, signing is refused and Settings says "NOT working": OpenBao is sealed. Unseal it with three keys (step 3).
